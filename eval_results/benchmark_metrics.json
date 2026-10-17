@@ -1,0 +1,25 @@
+{
+  "accuracy": 0.991,
+  "precision": 0.9919839679358717,
+  "recall": 0.99,
+  "f1": 0.990990990990991,
+  "roc_auc": 0.999314,
+  "eer": 0.009500000000000005,
+  "optimal_threshold": 0.4045780301094055,
+  "current_threshold": 0.44643253087997437,
+  "false_alarm_rate": 0.008,
+  "missed_spoof_rate": 0.01,
+  "confusion_matrix": [
+    [
+      992,
+      8
+    ],
+    [
+      10,
+      990
+    ]
+  ],
+  "total_samples": 2000,
+  "bonafide_count": 1000,
+  "spoof_count": 1000
+}

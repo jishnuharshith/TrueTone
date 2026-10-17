@@ -1,0 +1,12 @@
+[
+  {
+    "epoch": 1,
+    "train_loss": 0.17067085392773151,
+    "train_acc": 0.5625,
+    "val_loss": 0.1693372130393982,
+    "val_acc": 0.75,
+    "val_eer": 0.25,
+    "val_auc": 0.5,
+    "optimal_threshold": 0.5046489238739014
+  }
+]
