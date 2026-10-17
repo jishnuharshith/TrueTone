@@ -1,0 +1,7 @@
+{
+  "schema_version": "1",
+  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJTS21vY2siLCJzdWIiOiJBQ21vY2siLCJleHAiOjE3NzY0MTY0MDAsInZvaWNlIjp7fX0.mockSignatureOnlyNotValidForProduction",
+  "identity": "client:android_user",
+  "expires_in_seconds": 3600,
+  "issued_at_ms": 1776412800000
+}

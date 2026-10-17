@@ -1,0 +1,9 @@
+{
+  "schema_version": "1",
+  "type": "call.error",
+  "session_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+  "sequence": 6,
+  "timestamp_ms": 1776412815000,
+  "error_code": "ML_TIMEOUT",
+  "message": "Inference exceeded latency threshold; audio window discarded."
+}

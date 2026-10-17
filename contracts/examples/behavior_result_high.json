@@ -1,0 +1,15 @@
+{
+  "schema_version": "1",
+  "session_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+  "sequence": 4,
+  "language": "hi",
+  "confidence": 0.95,
+  "risk_level": "high",
+  "evidence_labels": [
+    "otp_request",
+    "threat",
+    "urgency"
+  ],
+  "model_version": "hybrid-baseline-v0.1",
+  "inference_ms": 185.2
+}

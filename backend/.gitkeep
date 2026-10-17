@@ -1,0 +1,3 @@
+# backend workstream
+FastAPI service on IBM LinuxONE s390x.
+Twilio Voice webhooks, media stream ingestion, audio windowing, and Android event distribution.
