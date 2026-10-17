@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Anti-Spoofing for Voice-Based Authentication: Defending Against Synthetic Speech Attacks
 ### IBM Z Datathon 2026 | Real-Time AI Vishing Detection System
 
@@ -189,3 +190,7 @@ else:
 2. **Senior Citizens**: Proactive protection against grandparent scams and voice impersonation.
 3. **Enterprises & Employees**: Prevention of CEO fraud and business email/phone compromise.
 4. **Telecom & VoIP Providers**: Carrier-grade edge anti-spoofing gateway filtering.
+=======
+# TrueTone
+
+>>>>>>> origin/main
