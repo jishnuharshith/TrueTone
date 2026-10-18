@@ -28,9 +28,37 @@ class VoiceAntiSpoofingTestSuite(unittest.TestCase):
         print(f"\n[Setup] Initializing VoiceSpoofDetector with: {cls.checkpoint_path}")
         cls.detector = VoiceSpoofDetector(checkpoint_path=cls.checkpoint_path)
         
-        # Audio test sample paths
-        cls.real_sample = r"E:\IBM\dataset\_sources_wavefake\real_voice\LJ001-0004.wav"
-        cls.fake_sample = r"E:\IBM\dataset\_sources_wavefake\fake_voice\LJ001-0004_generated.wav"
+        # Audio test sample paths - prioritize in-repo checked-in samples, fallback to external dataset
+        repo_dir = os.path.dirname(os.path.abspath(__file__))
+        bonafide_dir = os.path.join(repo_dir, "data", "dataset_test_samples", "bonafide")
+        spoof_dir = os.path.join(repo_dir, "data", "dataset_test_samples", "spoof")
+
+        in_repo_real = os.path.join(bonafide_dir, "LJ001-0004.wav")
+        in_repo_fake = os.path.join(spoof_dir, "LJ001-0004_generated.wav")
+        external_real = r"E:\IBM\dataset\_sources_wavefake\real_voice\LJ001-0004.wav"
+        external_fake = r"E:\IBM\dataset\_sources_wavefake\fake_voice\LJ001-0004_generated.wav"
+
+        import glob
+        all_real = sorted(glob.glob(os.path.join(bonafide_dir, "*.wav")))
+        all_fake = sorted(glob.glob(os.path.join(spoof_dir, "*.wav")))
+
+        if os.path.exists(in_repo_real):
+            cls.real_sample = in_repo_real
+        elif os.path.exists(external_real):
+            cls.real_sample = external_real
+        elif all_real:
+            cls.real_sample = all_real[0]
+        else:
+            cls.real_sample = in_repo_real
+
+        if os.path.exists(in_repo_fake):
+            cls.fake_sample = in_repo_fake
+        elif os.path.exists(external_fake):
+            cls.fake_sample = external_fake
+        elif all_fake:
+            cls.fake_sample = all_fake[0]
+        else:
+            cls.fake_sample = in_repo_fake
 
     def test_case_01_feature_extraction_dimensions(self):
         """Test Case 1: Feature Extraction Pipeline (LFCC + Deltas Shape)"""

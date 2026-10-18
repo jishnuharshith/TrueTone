@@ -1,5 +1,4 @@
-<<<<<<< HEAD
-# Anti-Spoofing for Voice-Based Authentication: Defending Against Synthetic Speech Attacks
+# TrueTone - Anti-Spoofing for Voice-Based Authentication: Defending Against Synthetic Speech Attacks
 ### IBM Z Datathon 2026 | Real-Time AI Vishing Detection System
 
 ---
@@ -143,22 +142,75 @@ python evaluate.py --checkpoint checkpoints/best_model.pt --test_dir data/test -
 
 ---
 
-## 🛡️ Real-Time Vishing Stream Monitor
-Simulate an incoming telephone call to see live frame-by-frame analysis:
+## 🛡️ Real-Time Live Call Vishing Defense Monitor
+
+TrueTone monitors live ongoing telephone calls in real time directly from your hardware or via WebSocket:
+
+### 1. Live Call Listening via Hardware (Speakerphone, Headset, or Softphone)
+Listen directly to an active live telephone call as it happens (sub-40ms latency, zero recording to disk):
+
 ```bash
-python realtime_detector.py --stream_file sample_call.wav --checkpoint checkpoints/best_model.pt
+# A. Speakerphone / Desk Phone / Headset Call:
+# Put your mobile on speaker next to your PC mic, or talk into your headset
+python realtime_detector.py --live
+
+# B. Desktop Call Software (Zoom, MS Teams, WhatsApp Desktop, Discord, Google Meet):
+# Intercept incoming audio directly through Stereo Mix without any external cables!
+python realtime_detector.py --list-devices
+# Note the device ID for 'Stereo Mix' (e.g. 17) and run:
+python realtime_detector.py --live --device 17
 ```
 
-Console Output Example:
+Live Console Output:
 ```
-=======================================================
-  REAL-TIME VISHING CALL MONITOR (INCOMING CALL SIMULATION)
-  Streaming: sample_call.wav
-=======================================================
-T= 0.5s | [✅ HUMAN BONAFIDE]  | AI Risk: [░░░░░░░░░░░░░░░░░░░░]   4.2% | Inference:  9.8ms
-T= 1.0s | [✅ HUMAN BONAFIDE]  | AI Risk: [░░░░░░░░░░░░░░░░░░░░]   6.1% | Inference:  8.4ms
-T= 1.5s | [🚨 VISHING ALERT! 🚨] | AI Risk: [██████████████████░░]  94.7% | Inference: 11.2ms
-T= 2.0s | [🚨 VISHING ALERT! 🚨] | AI Risk: [████████████████████]  98.9% | Inference: 10.5ms
+================================================================================
+  🛡️  TRUETONE: REAL-TIME LIVE CALL ANTI-VISHING DEFENSE MONITOR
+  Hardware Input Device:  [17] Stereo Mix (Realtek HD Audio Stereo input)
+  Sampling Frequency:     16000 Hz | Window: 3.0s | Hop: 0.5s | Device: CPU
+================================================================================
+[00:04] | [✅ AUTHENTIC HUMAN  ] | AI Risk: [░░░░░░░░░░░░░░░░░░░░]   0.0% | Latency: 37.1ms
+[00:08] | [🚨 CRITICAL VISHING! 🚨] | AI Risk: [████████████████████]  99.9% | Latency: 35.8ms
+```
+*(On Windows, an audible alarm warning tone automatically sounds via `winsound.Beep` when an AI voice attack is detected!)*
+
+### 2. Headless Streaming API for App Integration (WebSocket & REST)
+Launch the lightweight backend service for your mobile app, desktop app, or phone system:
+```bash
+python realtime_detector.py --api --port 8000
+```
+- **Real-Time WebSocket Stream**: Connect your app to `ws://localhost:8000/ws/live-call` and stream raw audio buffers (Float32 or Int16 PCM) as the call proceeds.
+- **REST Chunk Predictor**: Post base64 audio frames directly to `POST http://localhost:8000/api/predict_chunk`.
+- **Health Check**: `GET http://localhost:8000/health`.
+
+### 3. Direct In-Process Python App Integration
+You can import the detector directly into your Python / desktop app backend without any HTTP overhead:
+
+```python
+from realtime_detector import RealtimeVishingMonitor
+
+# Initialize live monitor (loads SE-ResNet model + adaptive VAD)
+monitor = RealtimeVishingMonitor(checkpoint_path="checkpoints/best_model.pt")
+
+# In your app audio stream callback (incoming chunk e.g. 100-200ms):
+result = monitor.process_chunk(audio_chunk_numpy)
+
+if result["is_silence"]:
+    print("Waiting for caller voice...")
+elif result["is_ai"]:
+    print(f"🚨 ALERT: AI voice clone detected! Risk: {result['ai_confidence_pct']}%")
+else:
+    print(f"✅ Authentic human caller. Risk: {result['ai_confidence_pct']}%")
+```
+
+### 4. Telephony Trunk & Twilio Live Media Streaming
+TrueTone accepts live telephony streams directly:
+- **Twilio Media Streams**: Automatically unpacks `{"event": "media", ...}`, decodes 8kHz ITU-T G.711 $\mu$-law, and resamples to 16kHz for continuous sub-40ms threat scoring.
+- **Raw PCM Streams**: Accepts 16-bit PCM or 32-bit Float PCM binary chunks directly from softphones, PBX trunks, or Asterisk.
+
+### 5. Audio File Call Simulation (Offline Test)
+Simulate an incoming telephone call using a pre-recorded audio file:
+```bash
+python realtime_detector.py --stream_file data/dataset_test_samples/spoof/LJ001-0004_generated.wav
 ```
 
 ---
@@ -190,7 +242,3 @@ else:
 2. **Senior Citizens**: Proactive protection against grandparent scams and voice impersonation.
 3. **Enterprises & Employees**: Prevention of CEO fraud and business email/phone compromise.
 4. **Telecom & VoIP Providers**: Carrier-grade edge anti-spoofing gateway filtering.
-=======
-# TrueTone
-
->>>>>>> origin/main

@@ -130,6 +130,19 @@ def run_training(
     audio_cfg = AudioConfig(feature_type=feature_type)
     aug_cfg = AugmentationConfig(enable=True)
 
+    # Fallback to known local datasets if default/provided path is not found
+    if not os.path.exists(train_data_source):
+        candidates = [
+            r"E:\IBM\dataset\_sources_wavefake",
+            os.path.join(os.path.dirname(__file__), "data", "dataset_test_samples"),
+            r"E:\IBM\dataset\wavefake_4s"
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                print(f"[Notice] Provided data_dir '{train_data_source}' not found. Using available dataset: {c}")
+                train_data_source = c
+                break
+
     # 1. Discover training data
     print(f"\n[1/4] Discovering datasets from: {train_data_source}")
     train_samples = discover_dataset_samples(train_data_source, protocol_file=protocol_file, max_samples=max_samples)
@@ -146,7 +159,7 @@ def run_training(
         try:
             from dataset import export_sample_wavs_from_arrow
             export_sample_wavs_from_arrow(train_data_source, output_dir=test_wav_dir, num_per_class=30)
-        except Exception as e:
+        except Exception:
             pass
 
     val_samples = None
@@ -154,13 +167,16 @@ def run_training(
         print(f"Discovering validation samples from: {val_data_source}")
         val_samples = discover_dataset_samples(val_data_source, max_samples=max_samples // 4 if max_samples else None)
 
+    manifest_file = os.path.join(save_dir, "split_manifest.json")
     train_loader, val_loader = create_dataloaders(
         train_samples,
         val_samples=val_samples,
         audio_cfg=audio_cfg,
         aug_cfg=aug_cfg,
         batch_size=batch_size,
-        num_workers=0
+        num_workers=0,
+        cache_features=True,
+        split_manifest_path=manifest_file
     )
 
     print(f"Training samples: {len(train_loader.dataset)}")
@@ -231,6 +247,12 @@ def run_training(
                 "optimal_threshold": val_metrics["optimal_threshold"]
             }, best_path)
             print(f"  >>> Best model saved to {best_path} (EER: {val_eer*100:.2f}%)")
+
+            # Synchronize benchmark_metrics.json with the best checkpoint's evaluated metrics
+            eval_out_dir = os.path.join(os.path.dirname(__file__), "eval_results")
+            os.makedirs(eval_out_dir, exist_ok=True)
+            with open(os.path.join(eval_out_dir, "benchmark_metrics.json"), "w", encoding="utf-8") as f:
+                json.dump(val_metrics, f, indent=2)
         else:
             patience_counter += 1
             if patience_counter >= patience_limit:

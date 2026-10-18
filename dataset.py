@@ -12,10 +12,13 @@ import io
 import glob
 import random
 import numpy as np
+import re
+import json
+from collections import defaultdict
 import scipy.signal
 import scipy.io.wavfile as wavfile
 import pandas as pd
-from typing import List, Tuple, Optional, Dict, Union
+from typing import List, Tuple, Optional, Dict, Union, Set
 import torch
 from torch.utils.data import Dataset, DataLoader
 
@@ -179,12 +182,15 @@ class VoiceAntiSpoofDataset(Dataset):
         samples: List[Union[Tuple[Union[str, bytes], int], Tuple[Union[str, bytes], int, str]]],
         audio_cfg: AudioConfig,
         aug_cfg: Optional[AugmentationConfig] = None,
-        is_train: bool = False
+        is_train: bool = False,
+        cache_features: bool = False
     ):
         self.samples = samples
         self.audio_cfg = audio_cfg
         self.is_train = is_train
         self.augmenter = AudioAugmenter(aug_cfg, sr=audio_cfg.sample_rate) if aug_cfg and is_train else None
+        self.cache_features = cache_features
+        self._feature_cache: Dict[int, torch.Tensor] = {} if cache_features else None
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -197,6 +203,12 @@ class VoiceAntiSpoofDataset(Dataset):
             audio_source, label = item
             path_id = str(audio_source) if isinstance(audio_source, str) else f"sample_{idx}"
 
+        label_tensor = torch.tensor(label, dtype=torch.long)
+
+        # In-memory feature cache hit
+        if self._feature_cache is not None and idx in self._feature_cache:
+            return self._feature_cache[idx], label_tensor, str(path_id)
+
         try:
             audio = load_audio_file(audio_source, target_sr=self.audio_cfg.sample_rate)
         except Exception as e:
@@ -207,8 +219,8 @@ class VoiceAntiSpoofDataset(Dataset):
         # Pad or trim to exact duration
         audio = pad_or_trim(audio, self.audio_cfg.n_samples, random_crop=self.is_train)
 
-        # Augmentation during training
-        if self.augmenter is not None:
+        # Augmentation during training (only when not caching static features)
+        if self.augmenter is not None and not self.cache_features:
             audio = self.augmenter.augment(audio)
 
         # Feature extraction (LFCC / Mel)
@@ -220,7 +232,9 @@ class VoiceAntiSpoofDataset(Dataset):
         )
 
         feat_tensor = torch.from_numpy(feature).float()  # (Channels, Freq, Time)
-        label_tensor = torch.tensor(label, dtype=torch.long)
+        if self._feature_cache is not None:
+            self._feature_cache[idx] = feat_tensor
+
         return feat_tensor, label_tensor, str(path_id)
 
 
@@ -469,19 +483,150 @@ def parse_protocol_file(protocol_path: str, base_audio_dir: str) -> List[Tuple[s
     return samples
 
 
+def get_sample_group_key(sample: Union[str, Tuple, bytes]) -> str:
+    """
+    Extracts the base utterance/speaker group key from a sample.
+    Ensures bonafide and all derived spoof syntheses (e.g. LJ001-0004 vs LJ001-0004_generated,
+    common_voice_de_38025175 vs common_voice_de_38025175_Gen) share the exact same key.
+    """
+    raw_id = ""
+    if isinstance(sample, str):
+        raw_id = sample
+    elif isinstance(sample, tuple):
+        if len(sample) >= 3 and isinstance(sample[2], str):
+            raw_id = sample[2]
+        elif isinstance(sample[0], str):
+            raw_id = sample[0]
+        else:
+            raw_id = str(id(sample))
+    else:
+        raw_id = str(sample)
+
+    name = os.path.basename(raw_id)
+    name = re.sub(r"\.(wav|mp3|flac|ogg|m4a)$", "", name, flags=re.IGNORECASE)
+    # Strip common artificial sample prefixes
+    name = re.sub(r"^(human|ai)_[0-9]+_", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"^sample_[0-9]+_", "", name, flags=re.IGNORECASE)
+    # Strip spoof / vocoder suffixes
+    name = re.sub(r"(_gen|_generated|_fake|_synth|_cloned|_16k)$", "", name, flags=re.IGNORECASE)
+    # Strip WaveFake background mixing tokens (e.g. 0862__LJ002-0219__X__fake_bg_0596)
+    name = re.sub(r"__X__.*$", "", name)
+    name = re.sub(r"^[0-9]+__", "", name)
+    return name.strip() or f"group_{abs(hash(str(raw_id)))}"
+
+
+def split_samples_by_group(
+    samples: List[Union[Tuple[Union[str, bytes], int], Tuple[Union[str, bytes], int, str]]],
+    val_ratio: float = 0.2,
+    seed: int = 42,
+    manifest_path: Optional[str] = None
+) -> Tuple[List, List]:
+    """
+    Split Design: Disjoint Stratified Group Split.
+    Partitions audio samples strictly at the utterance/speaker group level so that closely
+    related recordings (e.g. genuine audio and all AI vocoder clones derived from it)
+    NEVER appear in both training and validation sets simultaneously.
+    Guarantees 0% group leakage and balanced class stratification across splits.
+    """
+    random.seed(seed)
+    group_map = defaultdict(list)
+
+    for s in samples:
+        lbl = s[1] if isinstance(s, tuple) and len(s) >= 2 else 0
+        gk = get_sample_group_key(s)
+        group_map[gk].append((s, lbl))
+
+    # Stratify by group class profile: paired (both real & fake), bonafide-only, spoof-only
+    buckets = {"paired": [], "bonafide_only": [], "spoof_only": []}
+    for gk, items in group_map.items():
+        lbls = set(item[1] for item in items)
+        if len(lbls) > 1:
+            buckets["paired"].append((gk, [item[0] for item in items]))
+        elif LABEL_BONAFIDE in lbls:
+            buckets["bonafide_only"].append((gk, [item[0] for item in items]))
+        else:
+            buckets["spoof_only"].append((gk, [item[0] for item in items]))
+
+    train_samples, val_samples = [], []
+    train_groups: Set[str] = set()
+    val_groups: Set[str] = set()
+
+    for b_name, b_groups in buckets.items():
+        random.shuffle(b_groups)
+        val_k = max(1, int(len(b_groups) * val_ratio)) if (b_groups and val_ratio > 0) else 0
+        val_part = b_groups[:val_k]
+        train_part = b_groups[val_k:]
+
+        for gk, s_list in val_part:
+            val_samples.extend(s_list)
+            val_groups.add(gk)
+        for gk, s_list in train_part:
+            train_samples.extend(s_list)
+            train_groups.add(gk)
+
+    # Randomize within each split
+    random.shuffle(train_samples)
+    random.shuffle(val_samples)
+
+    # Integrity verification
+    leakage = train_groups.intersection(val_groups)
+    assert len(leakage) == 0, f"Critical split design error: {len(leakage)} groups leaked across train/val!"
+
+    tr_b = sum(1 for s in train_samples if (isinstance(s, tuple) and s[1] == LABEL_BONAFIDE))
+    tr_s = len(train_samples) - tr_b
+    va_b = sum(1 for s in val_samples if (isinstance(s, tuple) and s[1] == LABEL_BONAFIDE))
+    va_s = len(val_samples) - va_b
+
+    print("\n" + "=" * 60)
+    print("      DATASET SPLIT DESIGN VERIFICATION (GROUP-DISJOINT)")
+    print("=" * 60)
+    print(f"Total Unique Groups:     {len(group_map)}")
+    print(f" - Train Unique Groups:  {len(train_groups)}")
+    print(f" - Val Unique Groups:    {len(val_groups)}")
+    print(f"Group Leakage Check:     {len(leakage)} (0% LEAKAGE VERIFIED)")
+    print(f"Train Split Samples:     {len(train_samples)} (Human: {tr_b}, AI: {tr_s})")
+    print(f"Val Split Samples:       {len(val_samples)} (Human: {va_b}, AI: {va_s})")
+    print("=" * 60 + "\n")
+
+    if manifest_path:
+        os.makedirs(os.path.dirname(manifest_path) or ".", exist_ok=True)
+        manifest = {
+            "val_ratio": val_ratio,
+            "seed": seed,
+            "total_groups": len(group_map),
+            "train_groups": sorted(list(train_groups)),
+            "val_groups": sorted(list(val_groups)),
+            "leakage_count": len(leakage),
+            "train_sample_count": len(train_samples),
+            "val_sample_count": len(val_samples),
+            "train_bonafide": tr_b,
+            "train_spoof": tr_s,
+            "val_bonafide": va_b,
+            "val_spoof": va_s
+        }
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+        print(f"[*] Split manifest saved to: {manifest_path}")
+
+    return train_samples, val_samples
+
+
 def create_dataloaders(
-    train_samples: List[Tuple[str, int]],
-    val_samples: Optional[List[Tuple[str, int]]] = None,
+    train_samples: List[Union[Tuple[str, int], Tuple[bytes, int, str]]],
+    val_samples: Optional[List[Union[Tuple[str, int], Tuple[bytes, int, str]]]] = None,
     audio_cfg: Optional[AudioConfig] = None,
     aug_cfg: Optional[AugmentationConfig] = None,
     batch_size: int = 32,
     num_workers: int = 0,
     val_split_ratio: float = 0.2,
-    seed: int = 42
+    seed: int = 42,
+    cache_features: bool = False,
+    split_manifest_path: Optional[str] = "checkpoints/split_manifest.json"
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Creates train and validation PyTorch DataLoaders.
-    If val_samples is not provided, automatically splits train_samples.
+    If val_samples is not provided, automatically applies the group-disjoint split design
+    to ensure closely related recordings (e.g. real & cloned speech) are never in both sets.
     """
     if audio_cfg is None:
         audio_cfg = AudioConfig()
@@ -489,21 +634,25 @@ def create_dataloaders(
         aug_cfg = AugmentationConfig()
 
     if val_samples is None or len(val_samples) == 0:
-        # Split train_samples
-        random.seed(seed)
-        shuffled = list(train_samples)
-        random.shuffle(shuffled)
-        split_idx = int(len(shuffled) * (1.0 - val_split_ratio))
-        train_samples = shuffled[:split_idx]
-        val_samples = shuffled[split_idx:]
+        train_samples, val_samples = split_samples_by_group(
+            train_samples,
+            val_ratio=val_split_ratio,
+            seed=seed,
+            manifest_path=split_manifest_path
+        )
 
-    train_ds = VoiceAntiSpoofDataset(train_samples, audio_cfg=audio_cfg, aug_cfg=aug_cfg, is_train=True)
-    val_ds = VoiceAntiSpoofDataset(val_samples, audio_cfg=audio_cfg, aug_cfg=None, is_train=False)
+    train_ds = VoiceAntiSpoofDataset(
+        train_samples, audio_cfg=audio_cfg, aug_cfg=aug_cfg, is_train=True, cache_features=cache_features
+    )
+    val_ds = VoiceAntiSpoofDataset(
+        val_samples, audio_cfg=audio_cfg, aug_cfg=None, is_train=False, cache_features=cache_features
+    )
 
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
         shuffle=True,
+        drop_last=True,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available()
     )
