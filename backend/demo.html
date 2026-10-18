@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TrueTone demo</title>
+  <style>
+    body{font-family:system-ui,sans-serif;background:#101827;color:#f6f8fb;margin:0;padding:35px}
+    main{max-width:700px;margin:auto}h1{font-size:2.5rem}p{color:#b9c4d5}
+    textarea{width:100%;box-sizing:border-box;height:130px;padding:16px;font:1.2rem system-ui;border-radius:12px}
+    button{border:0;border-radius:10px;padding:13px 20px;margin:15px 10px 0 0;background:#4c9aff;color:white;font-weight:700;cursor:pointer}
+    button:disabled{opacity:.5;cursor:default}.card{background:#202d40;border-radius:18px;padding:24px;margin-top:25px}
+    .high{border:2px solid #ff5d6c}.low{border:2px solid #4bcd9d}.caution{border:2px solid #ffbf54}
+    .tag{display:inline-block;background:#344765;border-radius:10px;padding:8px;margin:6px}
+    #micIndicator{display:inline-block;width:12px;height:12px;border-radius:50%;background:#7c8798;margin-right:8px}
+    #micIndicator.recording{background:#ff5d6c;box-shadow:0 0 0 5px #ff5d6c33}
+    #micIndicator.processing{background:#ffbf54}
+  </style>
+</head>
+<body><main>
+  <h1>TrueTone</h1>
+  <p>Controlled hackathon demo: scripted text, browser microphone, and trial phone speech.</p>
+  <div class="card">
+    <label for="utterance">Caller says</label>
+    <textarea id="utterance">Please tell me your OTP right now or your account will be blocked.</textarea>
+    <div><button id="analyzeButton">Analyze scripted line</button><button id="safeButton">Try protective advice</button></div>
+  </div>
+  <div id="result" class="card" aria-live="polite">Choose a line and press Analyze.</div>
+  <div class="card">
+    <h2>Live microphone audio</h2>
+    <p>Speak a scripted Hindi test line into your phone. Audio goes to Whisper on LinuxONE and is held only in memory.</p>
+    <button id="micStart">Start microphone</button><button id="micStop" disabled>Stop</button>
+    <p><span id="micIndicator" aria-hidden="true"></span><span id="live" role="status" aria-live="polite">Microphone is off.</span></p>
+    <p id="micStats">Audio sent: 0 seconds · Input peak: 0%</p>
+  </div>
+  <div class="card">
+    <h2>Twilio phone demo</h2>
+    <p id="callStatus" aria-live="polite">Waiting for speech from a Twilio test call.</p>
+  </div>
+  <p>Phone results use Twilio speech recognition plus the text prototype. Browser microphone results use Whisper plus the text prototype. The trained classifier and AI voice detection are separate components.</p>
+</main>
+<script>
+  async function analyze(){
+    const box=document.getElementById('result');box.textContent='Analyzing…';
+    try{
+      const r=await fetch('/v1/demo/analyze-scripted-text',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({text:document.getElementById('utterance').value,language:'auto'})});
+      if(!r.ok)throw Error('HTTP '+r.status);
+      const x=await r.json();box.className='card '+x.risk_level;box.replaceChildren();
+      const title=document.createElement('h2');title.textContent='Risk: '+x.risk_level.replaceAll('_',' ').toUpperCase();box.append(title);
+      const info=document.createElement('p');info.textContent='Language: '+x.language+' · Confidence: '+Math.round(x.confidence*100)+'% · '+x.model_version;box.append(info);
+      for(const label of x.evidence_labels){const tag=document.createElement('span');tag.className='tag';tag.textContent=label.replaceAll('_',' ');box.append(tag)}
+    }catch(error){box.textContent='Demo error: '+error.message}
+  }
+  document.getElementById('analyzeButton').onclick=analyze;
+  document.getElementById('safeButton').onclick=()=>{document.getElementById('utterance').value='Never share your OTP with anyone. Contact your bank directly.';analyze()};
+</script>
+</body></html>

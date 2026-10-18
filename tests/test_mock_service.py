@@ -39,6 +39,18 @@ client = TestClient(app)
 TEST_AUTH_TOKEN = "test-secret-token-xyz-123"
 
 
+def test_live_mode_never_emits_mock_alerts(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "app_auth_token", TEST_AUTH_TOKEN)
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with client.websocket_connect(
+            "/v1/app/call-events",
+            headers={"Authorization": f"Bearer {TEST_AUTH_TOKEN}"},
+        ):
+            pytest.fail("Mock alert stream was accepted in live mode")
+    assert exc.value.code == 1008
+
+
 # ============================================================================
 # 1. Safe Health Endpoint
 # ============================================================================

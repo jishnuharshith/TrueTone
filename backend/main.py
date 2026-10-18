@@ -38,11 +38,18 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import TypeAdapter
+from pydantic import BaseModel, Field
 from starlette.datastructures import QueryParams
 from starlette.responses import Response
 from twilio.request_validator import RequestValidator
 
 from backend.config import settings
+from behavior_ml.text import classify_text
+from backend.live_audio import CallerAudioWindow, assess_caller_window
+from behavior_ml.asr import analyze_window_with_asr
+from behavior_ml.models import BehaviorWindow
+from backend.live_audio import LinuxOneWhisper
+from backend.line_type import lookup_line_type
 from contracts.models import AppEvent, BehaviorResult, RiskLevel
 
 logging.basicConfig(level=logging.INFO)
@@ -56,6 +63,9 @@ app = FastAPI(
     ),
     version=settings.version,
 )
+
+_latest_live_result: Dict[str, Any] = {"status": "waiting_for_call"}
+_mic_in_use = False
 
 # Enable CORS for local Android emulator / web testing
 app.add_middleware(
@@ -103,6 +113,156 @@ async def health_check() -> Dict[str, str]:
         "service": "ibm-z-datathon-backend",
         "version": settings.version,
     }
+
+
+class ScriptedDemoInput(BaseModel):
+    text: str = Field(min_length=1, max_length=500)
+    language: str = "auto"
+
+
+@app.post("/v1/demo/analyze-scripted-text", tags=["Demo"])
+async def analyze_scripted_text(payload: ScriptedDemoInput) -> Dict[str, Any]:
+    """Offline prototype demo using user-supplied scripted text; no call audio."""
+    if not settings.mock_mode:
+        raise HTTPException(status_code=503, detail="Scripted demo is disabled")
+    if payload.language not in {"auto", "en", "hi"}:
+        raise HTTPException(status_code=422, detail="Invalid language")
+    result = classify_text(payload.text, payload.language)
+    return {
+        "language": result.language,
+        "risk_level": result.risk_level,
+        "confidence": result.confidence,
+        "evidence_labels": result.evidence_labels,
+        "model_version": result.model_version,
+        "source": "scripted_text_demo",
+    }
+
+
+@app.get("/demo", tags=["Demo"])
+async def demo_page() -> Response:
+    if not settings.mock_mode:
+        raise HTTPException(status_code=404, detail="Unavailable")
+    page = Path(__file__).with_name("demo.html").read_text(encoding="utf-8")
+    page = page.replace("</html>", '<script src="/demo/microphone.js?v=4"></script></html>')
+    return Response(content=page, media_type="text/html", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/demo/microphone.js", tags=["Demo"])
+async def demo_microphone_script() -> Response:
+    if not settings.mock_mode:
+        raise HTTPException(status_code=404, detail="Unavailable")
+    return Response(content=Path(__file__).with_name("microphone.js").read_text(encoding="utf-8"),
+                    media_type="application/javascript", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/v1/demo/live-result", tags=["Demo"])
+async def latest_live_result() -> Dict[str, Any]:
+    if not settings.mock_mode:
+        raise HTTPException(status_code=404, detail="Unavailable")
+    return dict(_latest_live_result)
+
+
+@app.websocket("/v1/demo/microphone")
+async def demo_microphone(websocket: WebSocket) -> None:
+    """Short consented browser microphone demo; 16 kHz PCM, memory only."""
+    global _mic_in_use
+    if not settings.mock_mode or not settings.live_audio_demo or _mic_in_use:
+        await websocket.close(code=1008)
+        return
+    _mic_in_use = True
+    await websocket.accept()
+    session_id = str(uuid.uuid4())
+    audio = bytearray()
+    pending: Optional[asyncio.Task] = None
+    queued: Optional[tuple[int, bytes]] = None
+
+    def start_next(_finished: asyncio.Task) -> None:
+        nonlocal pending, queued
+        if (_latest_live_result.get("status") == "analyzed"
+                and _latest_live_result.get("risk_level") == "high"):
+            queued = None
+            pending = None
+            return
+        if queued is None:
+            pending = None
+            return
+        next_sequence, next_window = queued
+        queued = None
+        _latest_live_result.clear()
+        _latest_live_result.update({"status": "processing", "source": "browser_microphone"})
+        pending = asyncio.create_task(_process_pcm_window(session_id, next_sequence, next_window))
+        pending.add_done_callback(start_next)
+    sequence = 0
+    bytes_seen = 0
+    _latest_live_result.clear()
+    _latest_live_result.update({"status": "listening", "source": "browser_microphone"})
+    try:
+        while bytes_seen < 1_600_000:  # At most 50 seconds of 16 kHz PCM.
+            chunk = await asyncio.wait_for(websocket.receive_bytes(), timeout=30)
+            if len(chunk) > 32768 or len(chunk) % 2:
+                await websocket.close(code=1008)
+                return
+            bytes_seen += len(chunk)
+            audio.extend(chunk)
+            if len(audio) >= 128000:
+                window = bytes(audio[:128000])
+                # Keep two seconds of overlap so phrases near a boundary
+                # appear intact in the next four-second ASR window.
+                del audio[:64000]
+                if pending is None:
+                    if _latest_live_result.get("status") != "analyzed" or _latest_live_result.get("risk_level") != "high":
+                        _latest_live_result.clear()
+                        _latest_live_result.update({"status": "processing", "source": "browser_microphone"})
+                    pending = asyncio.create_task(_process_pcm_window(session_id, sequence, window))
+                    pending.add_done_callback(start_next)
+                else:
+                    # Keep the most recent full window while Whisper is busy.
+                    # It is still analyzed after the browser stops recording.
+                    queued = (sequence, window)
+                sequence += 1
+    except (WebSocketDisconnect, asyncio.TimeoutError):
+        pass
+    finally:
+        audio.clear()
+        _mic_in_use = False
+
+
+async def _process_pcm_window(session_id: str, sequence: int, pcm: bytes) -> None:
+    try:
+        request = BehaviorWindow("1", session_id, sequence, "hi", 16000, pcm,
+                                 sequence * 2000, sequence * 2000 + 4000)
+        result = await asyncio.to_thread(analyze_window_with_asr, request, LinuxOneWhisper())
+        if (_latest_live_result.get("status") == "analyzed"
+                and _latest_live_result.get("risk_level") == "high"
+                and result.risk_level != "high"):
+            return
+        _latest_live_result.clear()
+        _latest_live_result.update({"status": "analyzed", "source": "browser_microphone",
+                                    "risk_level": result.risk_level,
+                                    "confidence": result.confidence,
+                                    "evidence_labels": result.evidence_labels,
+                                    "language": result.language, "sequence": sequence,
+                                    "model_version": result.model_version})
+    except Exception:
+        _latest_live_result.clear()
+        _latest_live_result.update({"status": "analysis_unavailable"})
+
+
+async def _process_live_window(session_id: str, sequence: int, window: bytes,
+                               line_type: str = "unknown") -> None:
+    try:
+        result = await asyncio.to_thread(assess_caller_window, session_id, sequence, window)
+        _latest_live_result.clear()
+        _latest_live_result.update({"status": "analyzed", "risk_level": result.risk_level,
+                                    "source": "twilio_media", "line_type": line_type,
+                                    "confidence": result.confidence,
+                                    "evidence_labels": result.evidence_labels,
+                                    "language": result.language, "sequence": sequence,
+                                    "model_version": result.model_version})
+    except Exception:
+        logger.warning("Live audio window could not be analyzed")
+        _latest_live_result.clear()
+        _latest_live_result.update({"status": "analysis_unavailable"})
 
 
 def _canonical_public_origin() -> str:
@@ -156,6 +316,15 @@ async def twilio_voice_webhook(request: Request) -> Response:
         raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
     session_id = str(uuid.uuid4())
+    line_type = "unknown"
+    if settings.line_type_lookup:
+        if settings.twilio_api_key and settings.twilio_api_secret:
+            lookup_user, lookup_password = settings.twilio_api_key, settings.twilio_api_secret
+        else:
+            lookup_user, lookup_password = settings.twilio_account_sid, settings.twilio_auth_token
+        line_type = await lookup_line_type(
+            form.get("From", ""), lookup_user, lookup_password,
+        )
     stream_url = f"wss://{urlsplit(origin).netloc}{TWILIO_MEDIA_PATH}"
     # Build XML with ElementTree so URL and attributes are escaped safely.
     import xml.etree.ElementTree as ET
@@ -164,12 +333,121 @@ async def twilio_voice_webhook(request: Request) -> Response:
     start = ET.SubElement(root, "Start")
     stream = ET.SubElement(start, "Stream", {"url": stream_url, "track": "inbound_track"})
     ET.SubElement(stream, "Parameter", {"name": "sessionId", "value": session_id})
+    ET.SubElement(stream, "Parameter", {"name": "lineType", "value": line_type})
     ET.SubElement(root, "Say").text = (
-        "This call uses a demonstration mock. No real scam analysis is being performed."
+        "This is a controlled demonstration call. Speech analysis is experimental."
+        if settings.live_audio_demo else
+        "This is a mock demonstration call. No real scam analysis is running."
     )
-    ET.SubElement(root, "Pause", {"length": "30"})
+    if settings.twilio_forward_to:
+        destination = settings.twilio_forward_to.strip()
+        if not destination.startswith("+") or not destination[1:].isdigit():
+            raise HTTPException(status_code=503, detail="Forwarding destination is invalid")
+        dial = ET.SubElement(root, "Dial", {"answerOnBridge": "true", "timeout": "25"})
+        ET.SubElement(dial, "Number").text = destination
+    else:
+        ET.SubElement(root, "Say").text = "Call forwarding is not configured."
+        ET.SubElement(root, "Pause", {"length": "60"})
     xml_body = ET.tostring(root, encoding="unicode", short_empty_elements=True)
     return Response(content=xml_body, media_type="application/xml")
+
+
+@app.post("/v1/twilio/trial-voice", tags=["Twilio"])
+async def twilio_trial_voice(request: Request) -> Response:
+    """Trial-compatible phone demo using Twilio speech recognition.
+
+    Twilio trial accounts strip Media Streams, so this route collects one
+    spoken phrase with Gather and passes only Twilio's text to the prototype.
+    """
+    if not settings.mock_mode:
+        raise HTTPException(status_code=503, detail="Trial demo is disabled")
+    _latest_live_result.clear()
+    _latest_live_result.update({"status": "trial_webhook_received"})
+    body = await request.body()
+    if len(body) > MAX_TWILIO_WEBHOOK_BYTES:
+        raise HTTPException(status_code=413, detail="Webhook body too large")
+    try:
+        form = QueryParams(body.decode("utf-8"))
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="Malformed webhook form")
+    origin = _canonical_public_origin()
+    public_url = f"{origin}{request.url.path}"
+    if request.url.query:
+        public_url += f"?{request.url.query}"
+    if not _signature_valid([public_url], form, request.headers.get("x-twilio-signature")):
+        _latest_live_result.clear()
+        _latest_live_result.update({
+            "status": "trial_signature_rejected",
+            "signature_present": bool(request.headers.get("x-twilio-signature")),
+        })
+        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+
+    _latest_live_result.clear()
+    _latest_live_result.update({"status": "trial_waiting_for_speech"})
+
+    import xml.etree.ElementTree as ET
+
+    root = ET.Element("Response")
+    gather = ET.SubElement(root, "Gather", {
+        "input": "speech", "language": "hi-IN", "speechTimeout": "auto",
+        "timeout": "8", "method": "POST",
+        "action": f"{origin}/v1/twilio/trial-speech",
+    })
+    ET.SubElement(gather, "Say", {"language": "en-US"}).text = (
+        "TrueTone trial demo. After the tone, speak one test sentence."
+    )
+    ET.SubElement(root, "Say").text = "No speech was received. Goodbye."
+    return Response(content=ET.tostring(root, encoding="unicode"), media_type="application/xml")
+
+
+@app.post("/v1/twilio/trial-speech", tags=["Twilio"])
+async def twilio_trial_speech(request: Request) -> Response:
+    """Assess one Twilio-recognized utterance without storing a transcript."""
+    if not settings.mock_mode:
+        raise HTTPException(status_code=503, detail="Trial demo is disabled")
+    _latest_live_result.clear()
+    _latest_live_result.update({"status": "trial_speech_callback_received"})
+    body = await request.body()
+    if len(body) > MAX_TWILIO_WEBHOOK_BYTES:
+        raise HTTPException(status_code=413, detail="Webhook body too large")
+    try:
+        form = QueryParams(body.decode("utf-8"))
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="Malformed webhook form")
+    origin = _canonical_public_origin()
+    public_url = f"{origin}{request.url.path}"
+    if request.url.query:
+        public_url += f"?{request.url.query}"
+    if not _signature_valid([public_url], form, request.headers.get("x-twilio-signature")):
+        _latest_live_result.clear()
+        _latest_live_result.update({
+            "status": "trial_speech_signature_rejected",
+            "signature_present": bool(request.headers.get("x-twilio-signature")),
+        })
+        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+
+    phrase = form.get("SpeechResult", "").strip()[:500]
+    _latest_live_result.clear()
+    if phrase:
+        result = classify_text(phrase, "auto")
+        _latest_live_result.update({
+            "status": "analyzed", "source": "twilio_gather",
+            "risk_level": result.risk_level, "confidence": result.confidence,
+            "evidence_labels": result.evidence_labels, "language": result.language,
+            "model_version": "twilio-speech+" + result.model_version,
+        })
+    else:
+        _latest_live_result.update({
+            "status": "analyzed", "source": "twilio_gather",
+            "risk_level": "insufficient_evidence", "confidence": 0.0,
+            "evidence_labels": [], "language": "unknown",
+            "model_version": "twilio-speech+text-prototype-v1",
+        })
+    import xml.etree.ElementTree as ET
+
+    root = ET.Element("Response")
+    ET.SubElement(root, "Say").text = "Thank you. Check the TrueTone demo screen for the result."
+    return Response(content=ET.tostring(root, encoding="unicode"), media_type="application/xml")
 
 
 def mock_analyze_media(session_id: str, sequence: int, audio_payload: bytes) -> BehaviorResult:
@@ -223,6 +501,9 @@ async def twilio_media_websocket(websocket: WebSocket) -> None:
     started = False
     mock_emitted = False
     sequence = 0
+    live_window = CallerAudioWindow()
+    live_task: Optional[asyncio.Task] = None
+    line_type = "unknown"
     try:
         while True:
             raw_message = await websocket.receive_text()
@@ -249,11 +530,20 @@ async def twilio_media_websocket(websocket: WebSocket) -> None:
                 stream_sid = start.get("streamSid")
                 custom = start.get("customParameters") or {}
                 candidate = custom.get("sessionId") if isinstance(custom, dict) else None
+                candidate_line_type = custom.get("lineType") if isinstance(custom, dict) else None
                 if not isinstance(stream_sid, str) or not stream_sid or not isinstance(candidate, str):
                     await websocket.close(code=1008, reason="Invalid start event")
                     return
                 session_id = candidate
+                line_type = candidate_line_type if isinstance(candidate_line_type, str) and candidate_line_type in {
+                    "mobile", "landline", "fixedVoip", "nonFixedVoip", "personal",
+                    "tollFree", "premium", "sharedCost", "uan", "voicemail", "pager", "unknown"
+                } else "unknown"
                 started = True
+                if settings.live_audio_demo:
+                    _latest_live_result.clear()
+                    _latest_live_result.update({"status": "listening", "source": "twilio_media",
+                                                "line_type": line_type})
                 continue
             if event == "media":
                 media = message.get("media")
@@ -272,6 +562,21 @@ async def twilio_media_websocket(websocket: WebSocket) -> None:
                 if len(audio_payload) > MAX_TWILIO_MEDIA_BYTES:
                     await websocket.close(code=1009, reason="Media payload too large")
                     return
+                if settings.live_audio_demo:
+                    if media.get("track") not in (None, "inbound"):
+                        continue
+                    try:
+                        ready = live_window.add_payload(payload)
+                    except ValueError:
+                        await websocket.close(code=1008, reason="Invalid media frame")
+                        return
+                    if ready is not None:
+                        if live_task is None or live_task.done():
+                            live_task = asyncio.create_task(
+                                _process_live_window(session_id or "", live_window.sequence, ready, line_type)
+                            )
+                        live_window.sequence += 1
+                    continue
                 if not mock_emitted:
                     result = mock_analyze_media(session_id or "", sequence, audio_payload)
                     # Emit one assessment per call in this mock checkpoint to
@@ -306,6 +611,7 @@ async def twilio_media_websocket(websocket: WebSocket) -> None:
         except Exception:
             pass
     finally:
+        live_window.data.clear()
         # Per-connection identifiers/counters are local only; no call state,
         # audio, transcript, or caller metadata is persisted.
         session_id = None
@@ -422,6 +728,11 @@ async def mock_call_events_websocket(
       call.risk.update (high) -> call.ended
     - Strictly inspects no real caller content or live audio.
     """
+    # Never deliver fabricated risk alerts when the service is in live mode.
+    if not settings.mock_mode:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Live events unavailable")
+        return
+
     # Reject tokens in query string; accept ONLY Authorization: Bearer <token>
     candidate_token: Optional[str] = None
     if authorization:

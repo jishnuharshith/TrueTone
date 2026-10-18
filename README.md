@@ -1,6 +1,12 @@
 # IBM Z Datathon 2026 — Real-Time AI Prototype
 
-A real-time scammer-behavior detection prototype running on **IBM LinuxONE (s390x)** that analyzes live caller audio from consented Twilio Voice VoIP calls and pushes advisory scam risk alerts to an Android mobile client.
+## Integrated submission checkpoint
+
+Start with [SUBMISSION.md](SUBMISSION.md) for the current setup, verification and limitations. The integrated Android app in `android/` sends scripted text to FastAPI, displays real backend responses, and opens the browser microphone demo. The backend test suite passes (28 tests), and the debug APK builds successfully.
+
+Live Twilio speech analysis remains unverified. The trained classifier and AI-voice detector are not connected to this UI. The architecture below includes planned components; it is not a claim of completed end-to-end call protection.
+
+The project targets scammer-behavior detection using **IBM LinuxONE (s390x)**, consented audio and advisory Android risk alerts.
 
 ---
 

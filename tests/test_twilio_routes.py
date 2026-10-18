@@ -31,6 +31,8 @@ def client(monkeypatch):
     monkeypatch.setattr(settings, "twilio_auth_token", AUTH_TOKEN)
     monkeypatch.setattr(settings, "public_base_url", PUBLIC_ORIGIN)
     monkeypatch.setattr(settings, "mock_mode", True)
+    monkeypatch.setattr(settings, "live_audio_demo", False)
+    monkeypatch.setattr(settings, "line_type_lookup", False)
     with TestClient(backend_main.app) as test_client:
         yield test_client
 
@@ -61,7 +63,41 @@ def test_voice_webhook_requires_valid_signature(client):
     assert response.headers["content-type"].startswith("application/xml")
     assert "wss://test-tunnel.trycloudflare.com/v1/twilio/media" in response.text
     assert "mock" in response.text.lower()
-    assert "<Pause length=\"30\"" in response.text
+    assert "Call forwarding is not configured" in response.text
+
+
+def test_trial_speech_call_is_signed_and_classified(client):
+    import xml.etree.ElementTree as ET
+
+    body = urlencode({"CallSid": "CA-test", "From": "+15550000000"})
+    unsigned = client.post("/v1/twilio/trial-voice", content=body)
+    assert unsigned.status_code == 403
+    assert client.get("/v1/demo/live-result").json() == {
+        "status": "trial_signature_rejected", "signature_present": False,
+    }
+
+    sig = twilio_signature(f"{PUBLIC_ORIGIN}/v1/twilio/trial-voice", QueryParams(body))
+    response = client.post("/v1/twilio/trial-voice", content=body,
+                           headers={"x-twilio-signature": sig})
+    assert response.status_code == 200
+    root = ET.fromstring(response.text)
+    gather = root.find("Gather")
+    assert gather is not None
+    assert gather.attrib["input"] == "speech"
+    assert gather.attrib["action"] == f"{PUBLIC_ORIGIN}/v1/twilio/trial-speech"
+    assert root.find(".//Stream") is None
+
+    speech_body = urlencode({"CallSid": "CA-test", "SpeechResult": "Tell me your OTP now"})
+    speech_sig = twilio_signature(f"{PUBLIC_ORIGIN}/v1/twilio/trial-speech",
+                                  QueryParams(speech_body))
+    assessed = client.post("/v1/twilio/trial-speech", content=speech_body,
+                           headers={"x-twilio-signature": speech_sig})
+    assert assessed.status_code == 200
+    result = client.get("/v1/demo/live-result").json()
+    assert result["source"] == "twilio_gather"
+    assert result["risk_level"] == "high"
+    assert "otp_request" in result["evidence_labels"]
+    assert "SpeechResult" not in str(result)
 
 
 def test_voice_webhook_uses_canonical_url_and_rejects_bad_signature(client):
@@ -82,6 +118,28 @@ def test_voice_webhook_uses_canonical_url_and_rejects_bad_signature(client):
         headers={"content-type": "application/x-www-form-urlencoded", "x-twilio-signature": "bad"},
     )
     assert bad.status_code == 403
+
+
+def test_voice_webhook_passes_opt_in_line_type_to_stream(client, monkeypatch):
+    import xml.etree.ElementTree as ET
+
+    observed = []
+
+    async def fake_lookup(number, username, password):
+        observed.append(number)
+        return "nonFixedVoip"
+
+    monkeypatch.setattr(settings, "line_type_lookup", True)
+    monkeypatch.setattr(backend_main, "lookup_line_type", fake_lookup)
+    body = urlencode({"CallSid": "CA-test", "From": "+15550000000"})
+    sig = twilio_signature(f"{PUBLIC_ORIGIN}/v1/twilio/voice", QueryParams(body))
+    response = client.post("/v1/twilio/voice", content=body, headers={"x-twilio-signature": sig})
+    assert response.status_code == 200
+    root = ET.fromstring(response.text)
+    parameters = {node.attrib["name"]: node.attrib["value"]
+                  for node in root.findall("./Start/Stream/Parameter")}
+    assert parameters["lineType"] == "nonFixedVoip"
+    assert observed == ["+15550000000"]
 
 
 def ws_headers(url: str):

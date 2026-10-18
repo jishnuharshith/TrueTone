@@ -6,7 +6,11 @@ Zero hardcoded credentials.
 """
 
 import os
+from pathlib import Path
+from dotenv import load_dotenv
 from pydantic import BaseModel
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
 
 
 class Settings(BaseModel):
@@ -16,6 +20,8 @@ class Settings(BaseModel):
     port: int = int(os.getenv("BACKEND_PORT", "8000"))
     environment: str = os.getenv("ENVIRONMENT", "development")
     mock_mode: bool = os.getenv("MOCK_MODE", "true").lower() in ("true", "1", "yes")
+    live_audio_demo: bool = os.getenv("LIVE_AUDIO_DEMO", "false").lower() in ("true", "1", "yes")
+    line_type_lookup: bool = os.getenv("LINE_TYPE_LOOKUP", "false").lower() in ("true", "1", "yes")
 
     # Twilio & Push Configuration (Names only; no defaults for secrets)
     twilio_account_sid: str = os.getenv("TWILIO_ACCOUNT_SID", "")
@@ -26,6 +32,8 @@ class Settings(BaseModel):
     twilio_api_secret: str = os.getenv("TWILIO_API_SECRET", "")
     twilio_twiml_app_sid: str = os.getenv("TWILIO_TWIML_APP_SID", "")
     twilio_push_credential_sid: str = os.getenv("TWILIO_PUSH_CREDENTIAL_SID", "")
+    # Verified destination for temporary phone forwarding. Leave empty for mock response.
+    twilio_forward_to: str = os.getenv("TWILIO_FORWARD_TO", "")
 
     # Android App WebSocket Authentication Token
     # CRITICAL: This is strictly a TEMPORARY mock/development credential.

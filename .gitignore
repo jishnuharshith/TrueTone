@@ -1,5 +1,7 @@
 # Environment and Secrets (CRITICAL: Zero secrets in git)
 .env
+tools/cloudflared.exe
+runtime/
 .env.*
 *.env
 *.pem
