@@ -51,6 +51,7 @@ from behavior_ml.models import BehaviorWindow
 from backend.live_audio import LinuxOneWhisper
 from backend.line_type import lookup_line_type
 from contracts.models import AppEvent, BehaviorResult, RiskLevel
+from voice_spoof import detect_pcm_window, VoiceSpoofResult
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("backend")
@@ -135,6 +136,48 @@ async def analyze_scripted_text(payload: ScriptedDemoInput) -> Dict[str, Any]:
         "evidence_labels": result.evidence_labels,
         "model_version": result.model_version,
         "source": "scripted_text_demo",
+    }
+
+
+class AudioSpoofInput(BaseModel):
+    audio_b64: str = Field(description="Base64-encoded 16-bit PCM s16le audio at 16 kHz")
+    sample_rate: int = Field(default=16000, ge=8000, le=48000)
+
+
+@app.post("/v1/demo/analyze-voice-spoof", tags=["Demo"])
+async def analyze_voice_spoof(payload: AudioSpoofInput) -> Dict[str, Any]:
+    """Detect AI-synthesized / cloned voice in a base64-encoded PCM audio chunk.
+
+    Powered by Srikar's SE-ResNet model trained on WaveFake/ASVspoof datasets.
+    Returns AI confidence, human confidence, and risk level advisory.
+    Audio is processed in memory and never persisted.
+    """
+    if not settings.mock_mode:
+        raise HTTPException(status_code=503, detail="Voice spoof analysis is disabled")
+    try:
+        import base64 as _b64
+        pcm_bytes = _b64.b64decode(payload.audio_b64, validate=True)
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid base64 audio data")
+    if len(pcm_bytes) > 4_000_000:  # ~2 min at 16 kHz s16le
+        raise HTTPException(status_code=413, detail="Audio payload too large")
+
+    try:
+        result: VoiceSpoofResult = await asyncio.to_thread(
+            detect_pcm_window, pcm_bytes, payload.sample_rate
+        )
+    except Exception:
+        raise HTTPException(status_code=503, detail="Voice spoof analysis unavailable")
+
+    return {
+        "is_ai_voice": result.is_ai_voice,
+        "ai_confidence_pct": result.ai_confidence_pct,
+        "human_confidence_pct": result.human_confidence_pct,
+        "risk_level": result.risk_level,
+        "vishing_warning": result.vishing_warning,
+        "latency_ms": result.latency_ms,
+        "model_version": result.model_version,
+        "source": "voice_spoof_demo",
     }
 
 
@@ -231,18 +274,45 @@ async def _process_pcm_window(session_id: str, sequence: int, pcm: bytes) -> Non
     try:
         request = BehaviorWindow("1", session_id, sequence, "hi", 16000, pcm,
                                  sequence * 2000, sequence * 2000 + 4000)
-        result = await asyncio.to_thread(analyze_window_with_asr, request, LinuxOneWhisper())
+        # Run both models concurrently: behavioral text analysis + voice anti-spoofing
+        behavior_result, spoof_result = await asyncio.gather(
+            asyncio.to_thread(analyze_window_with_asr, request, LinuxOneWhisper()),
+            asyncio.to_thread(detect_pcm_window, pcm, 16000),
+        )
+        spoof_result: VoiceSpoofResult
+
+        # Merge risk: escalate if AI voice is detected with high confidence
+        merged_risk = behavior_result.risk_level
+        if spoof_result.is_ai_voice and spoof_result.ai_confidence_pct >= 85.0:
+            merged_risk = "high"  # CRITICAL AI voice → treat as high behavioral risk
+        elif spoof_result.is_ai_voice and merged_risk not in ("high",):
+            merged_risk = "caution"  # Probable AI voice → elevate to caution
+
         if (_latest_live_result.get("status") == "analyzed"
                 and _latest_live_result.get("risk_level") == "high"
-                and result.risk_level != "high"):
+                and merged_risk != "high"):
             return
         _latest_live_result.clear()
-        _latest_live_result.update({"status": "analyzed", "source": "browser_microphone",
-                                    "risk_level": result.risk_level,
-                                    "confidence": result.confidence,
-                                    "evidence_labels": result.evidence_labels,
-                                    "language": result.language, "sequence": sequence,
-                                    "model_version": result.model_version})
+        _latest_live_result.update({
+            "status": "analyzed",
+            "source": "browser_microphone",
+            "risk_level": merged_risk,
+            "confidence": behavior_result.confidence,
+            "evidence_labels": behavior_result.evidence_labels,
+            "language": behavior_result.language,
+            "sequence": sequence,
+            "model_version": behavior_result.model_version,
+            # Voice spoofing layer
+            "voice_spoof": {
+                "is_ai_voice": spoof_result.is_ai_voice,
+                "ai_confidence_pct": spoof_result.ai_confidence_pct,
+                "human_confidence_pct": spoof_result.human_confidence_pct,
+                "risk_level": spoof_result.risk_level,
+                "vishing_warning": spoof_result.vishing_warning,
+                "latency_ms": spoof_result.latency_ms,
+                "model_version": spoof_result.model_version,
+            },
+        })
     except Exception:
         _latest_live_result.clear()
         _latest_live_result.update({"status": "analysis_unavailable"})
@@ -251,14 +321,42 @@ async def _process_pcm_window(session_id: str, sequence: int, pcm: bytes) -> Non
 async def _process_live_window(session_id: str, sequence: int, window: bytes,
                                line_type: str = "unknown") -> None:
     try:
-        result = await asyncio.to_thread(assess_caller_window, session_id, sequence, window)
+        # Run behavioral + voice-spoof models in parallel
+        result, spoof_result = await asyncio.gather(
+            asyncio.to_thread(assess_caller_window, session_id, sequence, window),
+            asyncio.to_thread(detect_pcm_window, window, 16000),
+        )
+        spoof_result: VoiceSpoofResult
+
+        # Merge risk levels
+        merged_risk = result.risk_level
+        if spoof_result.is_ai_voice and spoof_result.ai_confidence_pct >= 85.0:
+            merged_risk = "high"
+        elif spoof_result.is_ai_voice and merged_risk not in ("high",):
+            merged_risk = "caution"
+
         _latest_live_result.clear()
-        _latest_live_result.update({"status": "analyzed", "risk_level": result.risk_level,
-                                    "source": "twilio_media", "line_type": line_type,
-                                    "confidence": result.confidence,
-                                    "evidence_labels": result.evidence_labels,
-                                    "language": result.language, "sequence": sequence,
-                                    "model_version": result.model_version})
+        _latest_live_result.update({
+            "status": "analyzed",
+            "risk_level": merged_risk,
+            "source": "twilio_media",
+            "line_type": line_type,
+            "confidence": result.confidence,
+            "evidence_labels": result.evidence_labels,
+            "language": result.language,
+            "sequence": sequence,
+            "model_version": result.model_version,
+            # Voice spoofing layer
+            "voice_spoof": {
+                "is_ai_voice": spoof_result.is_ai_voice,
+                "ai_confidence_pct": spoof_result.ai_confidence_pct,
+                "human_confidence_pct": spoof_result.human_confidence_pct,
+                "risk_level": spoof_result.risk_level,
+                "vishing_warning": spoof_result.vishing_warning,
+                "latency_ms": spoof_result.latency_ms,
+                "model_version": spoof_result.model_version,
+            },
+        })
     except Exception:
         logger.warning("Live audio window could not be analyzed")
         _latest_live_result.clear()
